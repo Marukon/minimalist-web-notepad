@@ -1,32 +1,68 @@
 <?php
-
-// Path to the directory to save the notes in, without trailing slash.
-// Should be outside the document root, if possible.
 $save_path = '_tmp';
-
-// Disable caching.
 header('Cache-Control: no-store');
 
-// If no note name is provided, or if the name is too long, or if it contains invalid characters.
 if (!isset($_GET['note']) || strlen($_GET['note']) > 64 || !preg_match('/^[a-zA-Z0-9_-]+$/', $_GET['note'])) {
-    // Generate a name with 5 random unambiguous characters. Redirect to it.
     header("Location: " . substr(str_shuffle('234579abcdefghjkmnpqrstwxyz'), -5));
     die;
 }
 
 $path = $save_path . '/' . $_GET['note'];
+$version_path = $path . '.version';
+$patches_path = $path . '.patches';
 
-// 处理版本控制和冲突检测
+if (isset($_GET['poll'])) {
+    $clientVersion = intval($_GET['version'] ?? 0);
+    $timeout = 25;
+    $startTime = time();
+    
+    while (true) {
+        clearstatcache();
+        $currentVersion = file_exists($version_path) ? intval(file_get_contents($version_path)) : 0;
+        
+        if ($currentVersion > $clientVersion) {
+            $patches = [];
+            if (file_exists($patches_path)) {
+                $allPatches = json_decode(file_get_contents($patches_path), true) ?: [];
+                foreach ($allPatches as $patch) {
+                    if ($patch['version'] > $clientVersion) {
+                        $patches[] = $patch;
+                    }
+                }
+            }
+            
+            header('Content-Type: application/json');
+            echo json_encode([
+                'version' => $currentVersion,
+                'patches' => $patches
+            ]);
+            exit;
+        }
+        
+        if (time() - $startTime > $timeout) {
+            header('Content-Type: application/json');
+            echo json_encode(['timeout' => true]);
+            exit;
+        }
+        
+        usleep(100000);
+    }
+}
+
 if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-    $text = isset($_POST['text']) ? $_POST['text'] : file_get_contents("php://input");
-    $clientVersion = isset($_POST['version']) ? intval($_POST['version']) : 0;
-    $userId = isset($_POST['userId']) ? $_POST['userId'] : '';
+    $data = json_decode(file_get_contents("php://input"), true);
+    $text = $data['text'] ?? '';
+    $clientVersion = intval($data['version'] ?? 0);
+    $userId = $data['userId'] ?? '';
+    $patch = $data['patch'] ?? null;
 
-    // 读取服务器当前内容和版本
     $serverData = file_exists($path) ? file_get_contents($path) : '';
-    $currentVersion = file_exists($path . '.version') ? intval(file_get_contents($path . '.version')) : 0;
+    $currentVersion = file_exists($version_path) ? intval(file_get_contents($version_path)) : 0;
 
-    // 冲突检测
+    if ($patch && is_array($patch)) {
+        $text = applyPatch($serverData, $patch);
+    }
+
     if ($clientVersion < $currentVersion) {
         header('HTTP/1.1 409 Conflict');
         echo json_encode([
@@ -36,17 +72,30 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         die;
     }
 
-    // 更新文件内容
-    file_put_contents($path, $text);
-    
-    // 更新版本号
-    $newVersion = $currentVersion + 1;
-    file_put_contents($path . '.version', $newVersion);
+    if (!is_dir(dirname($path))) {
+        mkdir(dirname($path), 0755, true);
+    }
 
-    // 如果提供的输入为空，删除文件
-    if (!strlen($text)) {
-        unlink($path);
-        unlink($path . '.version');
+    file_put_contents($path, $text);
+    $newVersion = $currentVersion + 1;
+    file_put_contents($version_path, $newVersion);
+    
+    $patches = [];
+    if (file_exists($patches_path)) {
+        $patches = json_decode(file_get_contents($patches_path), true) ?: [];
+    }
+    
+    if ($patch) {
+        $patches[] = [
+            'version' => $newVersion,
+            'patch' => $patch,
+            'userId' => $userId,
+            'timestamp' => time()
+        ];
+        if (count($patches) > 50) {
+            $patches = array_slice($patches, -50);
+        }
+        file_put_contents($patches_path, json_encode($patches));
     }
 
     echo json_encode([
@@ -56,11 +105,25 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
     die;
 }
 
-// Print raw file when explicitly requested, or if the client is curl or wget.
+function applyPatch($text, $patch) {
+    usort($patch, function($a, $b) {
+        return $b['pos'] - $a['pos'];
+    });
+    
+    foreach ($patch as $p) {
+        if ($p['op'] === 'insert') {
+            $text = substr($text, 0, $p['pos']) . $p['text'] . substr($text, $p['pos']);
+        } elseif ($p['op'] === 'delete') {
+            $text = substr($text, 0, $p['pos']) . substr($text, $p['pos'] + $p['length']);
+        }
+    }
+    return $text;
+}
+
 if (isset($_GET['raw']) || strpos($_SERVER['HTTP_USER_AGENT'], 'curl') === 0 || strpos($_SERVER['HTTP_USER_AGENT'], 'Wget') === 0) {
     if (is_file($path)) {
         header('Content-type: application/json');
-        $version = file_exists($path . '.version') ? file_get_contents($path . '.version') : 0;
+        $version = file_exists($version_path) ? file_get_contents($version_path) : 0;
         echo json_encode([
             'content' => file_get_contents($path),
             'version' => $version
@@ -70,13 +133,13 @@ if (isset($_GET['raw']) || strpos($_SERVER['HTTP_USER_AGENT'], 'curl') === 0 || 
     }
     die;
 }
-
-?><!DOCTYPE html>
+?>
+<!DOCTYPE html>
 <html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
-<title><?php print $_GET['note']; ?></title>
+<title><?php print htmlspecialchars($_GET['note'], ENT_QUOTES, 'UTF-8'); ?></title>
 <link rel="icon" href="favicon.ico" sizes="any">
 <link rel="icon" href="favicon.svg" type="image/svg+xml">
 <link href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/all.min.css" rel="stylesheet">
@@ -104,18 +167,19 @@ body {
     outline: none;
     line-height: 1.6;
     font-size: 16px;
+    background: white;
 }
 #content {
     resize: none;
 }
 #preview {
+    display: none;
     white-space: pre-wrap;
     word-wrap: break-word;
-    background: white;
-    display: none;
 }
 #preview strong {
     font-size: 1.5em;
+    color: #333;
 }
 #printable {
     display: none;
@@ -166,17 +230,35 @@ body {
 }
 #previewBtn { background: #4CAF50; color: white; }
 #boldBtn { background: #FF9800; color: white; }
+#undoBtn { background: #F44336; color: white; }
 #copyBtn { background: #2196F3; color: white; }
 #refreshBtn { background: #9C27B0; color: white; }
-#downloadBtn { background: #607D8B; color: white; }
-#undoBtn { background: #F44336; color: white; }
-#redoBtn { background: #8BC34A; color: white; }
 #saveBtn { background: #3F51B5; color: white; }
+#downloadBtn { background: #607D8B; color: white; }
 
 #toolbar button:hover {
     opacity: 0.9;
     transform: translateY(-2px);
     box-shadow: 0 2px 5px rgba(0,0,0,0.2);
+}
+
+#toolbar button:disabled {
+    opacity: 0.6;
+    cursor: not-allowed;
+    transform: none;
+    box-shadow: none;
+}
+
+#toolbar button.saving {
+    opacity: 0.7;
+    cursor: not-allowed;
+}
+#toolbar button.saving i {
+    animation: spin 1s linear infinite;
+}
+@keyframes spin {
+    0% { transform: rotate(0deg); }
+    100% { transform: rotate(360deg); }
 }
 
 @media (max-width: 600px) {
@@ -196,9 +278,6 @@ body {
         padding: 8px;
         gap: 4px;
     }
-    #toolbar button i {
-        margin-right: 5px;
-    }
     #downloadBtn {
         display: none !important;
     }
@@ -213,6 +292,9 @@ body {
     }
     #toolbar {
         background: #333b4d;
+    }
+    #preview strong {
+        color: #fff;
     }
 }
 
@@ -230,12 +312,11 @@ body {
 <body>
 <div id="toolbar">
     <button id="previewBtn"><i class="fas fa-eye"></i>预览</button>
-    <button id="boldBtn"><i class="fas fa-bold"></i>加粗选中</button>
+    <button id="boldBtn"><i class="fas fa-bold"></i>加粗</button>
+    <button id="undoBtn"><i class="fas fa-undo"></i>撤销</button>
     <button id="copyBtn"><i class="fas fa-copy"></i>复制全部</button>
     <button id="refreshBtn"><i class="fas fa-sync"></i>刷新内容</button>
     <button id="saveBtn"><i class="fas fa-save"></i>手动保存</button>
-    <button id="undoBtn"><i class="fas fa-undo"></i>撤销</button>
-    <button id="redoBtn"><i class="fas fa-redo"></i>重做</button>
     <button id="downloadBtn"><i class="fas fa-download"></i>下载文件</button>
 </div>
 <div class="container">
@@ -248,363 +329,355 @@ if (is_file($path)) {
 </div>
 <pre id="printable"></pre>
 <div id="status"></div>
+
 <script>
-class UndoManager {
-    constructor(maxHistory = 20) {
-        this.history = [];
-        this.currentIndex = -1;
-        this.maxHistory = maxHistory;
-    }
-
-    save(content) {
-        if (this.history[this.currentIndex] !== content) {
-            if (this.currentIndex < this.history.length - 1) {
-                this.history = this.history.slice(0, this.currentIndex + 1);
-            }
-
-            this.history.push(content);
-            
-            if (this.history.length > this.maxHistory) {
-                this.history.shift();
-            }
-
-            this.currentIndex = this.history.length - 1;
-        }
-    }
-
-    undo() {
-        if (this.currentIndex > 0) {
-            this.currentIndex--;
-            return this.history[this.currentIndex];
-        }
-        return null;
-    }
-
-    redo() {
-        if (this.currentIndex < this.history.length - 1) {
-            this.currentIndex++;
-            return this.history[this.currentIndex];
-        }
-        return null;
-    }
-}
-
-const undoManager = new UndoManager();
-
-// 用户唯一标识
-const userId = Math.random().toString(36).substr(2, 8);
-let serverContent = ''; 
-let serverVersion = 0;
-let lastModifiedTime = 0;
-let isTyping = false;
-let pendingSave = false;
-let saveTimer = null;
-let isPreviewMode = false;
-
-const textarea = document.getElementById('content');
-const preview = document.getElementById('preview');
-const printable = document.getElementById('printable');
-const previewBtn = document.getElementById('previewBtn');
-const boldBtn = document.getElementById('boldBtn');
-const copyBtn = document.getElementById('copyBtn');
-const refreshBtn = document.getElementById('refreshBtn');
-const downloadBtn = document.getElementById('downloadBtn');
-const undoBtn = document.getElementById('undoBtn');
-const redoBtn = document.getElementById('redoBtn');
-const saveBtn = document.getElementById('saveBtn');
-
-function showStatus(message, isError) {
-    const status = document.getElementById('status');
-    status.textContent = message;
-    status.style.backgroundColor = isError ? '#f44336' : '#4CAF50';
-    status.style.opacity = 1;
-    setTimeout(() => {
-        status.style.opacity = 0;
-    }, 2000);
-}
-
-function getServerContent(callback) {
-    const request = new XMLHttpRequest();
-    request.open('GET', window.location.href + '?raw&_=' + Date.now(), true);
-    request.onload = function() {
-        if (request.readyState === 4 && request.status === 200) {
-            const response = JSON.parse(request.responseText);
-            serverContent = response.content;
-            serverVersion = response.version;
-            if (typeof callback === 'function') {
-                callback(serverContent, serverVersion);
-            }
-        }
-    };
-    request.onerror = function() {
-        showStatus('无法获取服务器内容', true);
-    };
-    request.send();
-}
-
-function saveContent(newContent) {
-    if (saveTimer) {
-        clearTimeout(saveTimer);
+document.addEventListener('DOMContentLoaded', function() {
+    const textarea = document.getElementById('content');
+    const preview = document.getElementById('preview');
+    const statusDiv = document.getElementById('status');
+    const previewBtn = document.getElementById('previewBtn');
+    const saveBtn = document.getElementById('saveBtn');
+    
+    let serverVersion = 0;
+    let isPreviewMode = false;
+    let userId = Math.random().toString(36).substr(2, 8);
+    let lastContent = '';
+    let pollTimeout = null;
+    let isApplyingRemotePatch = false;
+    let lastInputTime = 0;
+    let inputDelay = 300;
+    let history = [];
+    let historyIndex = -1;
+    
+    function initializeContent() {
+        fetch(window.location.href + '?raw&_=' + Date.now())
+            .then(response => response.json())
+            .then(data => {
+                textarea.value = data.content;
+                lastContent = data.content;
+                serverVersion = parseInt(data.version) || 0;
+                history = [data.content];
+                historyIndex = 0;
+                startPolling();
+            });
     }
     
-    const request = new XMLHttpRequest();
-    request.open('POST', window.location.href, true);
-    request.setRequestHeader('Content-Type', 'application/x-www-form-urlencoded; charset=UTF-8');
-    request.onload = function() {
-        if (request.readyState === 4) {
-            if (request.status === 200) {
-                const response = JSON.parse(request.responseText);
-                serverContent = newContent;
-                serverVersion = response.version;
-                lastModifiedTime = Date.now();
-                showStatus('已保存 ' + new Date().toLocaleTimeString(), false);
-            } else if (request.status === 409) {
-                // 检测到冲突
-                const conflictResponse = JSON.parse(request.responseText);
-                handleConflict(conflictResponse.serverContent, conflictResponse.serverVersion);
-            } else {
-                showStatus('保存失败', true);
-            }
-            pendingSave = false;
+    function generatePatch(oldText, newText) {
+        if (oldText === newText) return null;
+        
+        let start = 0;
+        while (start < oldText.length && start < newText.length && oldText[start] === newText[start]) {
+            start++;
         }
-    };
-    request.onerror = function() {
-        showStatus('网络错误，正在重试...', true);
-        pendingSave = false;
-        saveTimer = setTimeout(() => saveContent(newContent), 5000);
-    };
-    request.send('text=' + encodeURIComponent(newContent) + '&version=' + serverVersion + '&userId=' + userId);
-}
-
-function handleConflict(serverContent, serverVersion) {
-    if (confirm('检测到内容冲突，是否加载服务器最新内容？')) {
-        textarea.value = serverContent;
-        printable.textContent = serverContent;
-        serverContent = serverContent;
-        serverVersion = serverVersion;
-        undoManager.save(serverContent);
+        
+        let oldEnd = oldText.length;
+        let newEnd = newText.length;
+        while (oldEnd > start && newEnd > start && oldText[oldEnd - 1] === newText[newEnd - 1]) {
+            oldEnd--;
+            newEnd--;
+        }
+        
+        const patch = [];
+        if (oldEnd > start) {
+            patch.push({
+                op: 'delete',
+                pos: start,
+                length: oldEnd - start
+            });
+        }
+        
+        if (newEnd > start) {
+            patch.push({
+                op: 'insert',
+                pos: start,
+                text: newText.substring(start, newEnd)
+            });
+        }
+        
+        return patch;
     }
-}
-
-function manualSave() {
-    const currentContent = textarea.value;
-    undoManager.save(currentContent);
-    saveContent(currentContent);
-    showStatus('手动保存成功', false);
-}
-
-function forceRefreshContent() {
-    // 强制刷新，不管是否有未保存的修改
-    getServerContent(function(content, version) {
-        if (textarea.value !== content) {
+    
+    function applyRemotePatches(patches) {
+        if (isApplyingRemotePatch || !patches || patches.length === 0) return;
+        
+        isApplyingRemotePatch = true;
+        let content = textarea.value;
+        const selectionStart = textarea.selectionStart;
+        const selectionEnd = textarea.selectionEnd;
+        
+        patches.sort((a, b) => a.version - b.version);
+        
+        patches.forEach(patchData => {
+            if (patchData.patch) {
+                content = applyPatch(content, patchData.patch);
+            }
+        });
+        
+        if (content !== textarea.value) {
             textarea.value = content;
-            printable.textContent = content;
-            serverContent = content;
-            serverVersion = version;
-            undoManager.save(content);
-            showStatus('内容已刷新', false);
+            lastContent = content;
+            
+            const lengthDiff = content.length - textarea.value.length;
+            const newSelectionStart = Math.max(0, selectionStart + lengthDiff);
+            const newSelectionEnd = Math.max(0, selectionEnd + lengthDiff);
+            
+            setTimeout(() => {
+                textarea.setSelectionRange(newSelectionStart, newSelectionEnd);
+            }, 0);
+            
+            history.push(content);
+            historyIndex++;
+        }
+        
+        isApplyingRemotePatch = false;
+    }
+    
+    function applyPatch(text, patch) {
+        [...patch].reverse().forEach(p => {
+            if (p.op === 'insert') {
+                text = text.substring(0, p.pos) + p.text + text.substring(p.pos);
+            } else if (p.op === 'delete') {
+                text = text.substring(0, p.pos) + text.substring(p.pos + p.length);
+            }
+        });
+        return text;
+    }
+    
+    function startPolling() {
+        if (pollTimeout) {
+            clearTimeout(pollTimeout);
+        }
+        
+        fetch(`${window.location.href}?poll&version=${serverVersion}&_=${Date.now()}`)
+            .then(response => response.json())
+            .then(data => {
+                if (data.timeout) {
+                    pollTimeout = setTimeout(startPolling, 100);
+                } else if (data.version > serverVersion) {
+                    serverVersion = data.version;
+                    applyRemotePatches(data.patches);
+                    pollTimeout = setTimeout(startPolling, 100);
+                } else {
+                    startPolling();
+                }
+            })
+            .catch(error => {
+                console.error('Polling error:', error);
+                pollTimeout = setTimeout(startPolling, 1000);
+            });
+    }
+    
+    async function saveContent(newContent, isManualSave = false) {
+        const now = Date.now();
+        if (!isManualSave && now - lastInputTime < inputDelay) {
+            return;
+        }
+
+        const patch = generatePatch(lastContent, newContent);
+        if (!patch && !isManualSave) return;
+
+        lastContent = newContent;
+
+        const response = await fetch(window.location.href, {
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json'
+            },
+            body: JSON.stringify({
+                text: newContent,
+                version: serverVersion,
+                userId: userId,
+                patch: patch
+            })
+        });
+
+        if (!response.ok) {
+            const errorData = await response.json().catch(() => null);
+            const errorMsg = errorData?.message || response.statusText;
+            throw new Error(errorMsg || `HTTP错误: ${response.status}`);
+        }
+
+        const data = await response.json();
+        serverVersion = data.version;
+        return data;
+    }
+
+    async function manualSave() {
+        if (isPreviewMode) {
+            showStatus('请在编辑模式下保存', true);
+            return;
+        }
+        
+        const originalHTML = saveBtn.innerHTML;
+        
+        saveBtn.innerHTML = '<i class="fas fa-spinner"></i>保存中...';
+        saveBtn.disabled = true;
+        
+        try {
+            const result = await saveContent(textarea.value, true);
+            showStatus('手动保存成功 ' + new Date().toLocaleTimeString());
+            return result;
+        } catch (error) {
+            console.error('保存失败:', error);
+            showStatus('手动保存失败: ' + (error.message || '服务器错误'), true);
+            throw error;
+        } finally {
+            saveBtn.innerHTML = originalHTML;
+            saveBtn.disabled = false;
+        }
+    }
+
+    function handleConflict(serverContent, serverVersion) {
+        textarea.value = serverContent;
+        lastContent = serverContent;
+        this.serverVersion = serverVersion;
+        history.push(serverContent);
+        historyIndex++;
+        showStatus('已从服务器加载最新内容');
+    }
+    
+    function showStatus(message, isError = false) {
+        statusDiv.textContent = message;
+        statusDiv.style.backgroundColor = isError ? '#f44336' : '#4CAF50';
+        statusDiv.style.opacity = 1;
+        setTimeout(() => {
+            statusDiv.style.opacity = 0;
+        }, 2000);
+    }
+    
+  previewBtn.addEventListener('click', function() {
+        isPreviewMode = !isPreviewMode;
+        
+        if (isPreviewMode) {
+            textarea.style.display = 'none';
+            preview.style.display = 'block';
+            preview.innerHTML = textarea.value
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
+                .replace(/\n/g, '<br>');
+            this.innerHTML = '<i class="fas fa-edit"></i>编辑';
         } else {
-            showStatus('内容已是最新', false);
+            textarea.style.display = 'block';
+            preview.style.display = 'none';
+            this.innerHTML = '<i class="fas fa-eye"></i>预览';
         }
     });
-}
-
-function debounceSave() {
-    if (saveTimer) {
-        clearTimeout(saveTimer);
-    }
     
-    const currentContent = textarea.value;
-    if (currentContent !== serverContent) {
-        pendingSave = true;
-        saveTimer = setTimeout(() => {
-            undoManager.save(currentContent);
-            saveContent(currentContent);
-        }, 500);
-    }
-}
-
-function copyAllContent() {
-    textarea.select();
-    document.execCommand('copy');
-    showStatus('已复制全部内容', false);
-    window.getSelection().removeAllRanges();
-}
-
-function downloadFile() {
-    const content = textarea.value;
-    const blob = new Blob([content], { type: 'text/plain' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = window.location.pathname.split('/').pop() || 'note.txt';
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    URL.revokeObjectURL(url);
-    showStatus('文件下载中...', false);
-}
-
-function undoChanges() {
-    const previousContent = undoManager.undo();
-    if (previousContent !== null) {
-        textarea.value = previousContent;
-        printable.textContent = previousContent;
+    document.getElementById('boldBtn').addEventListener('click', function() {
+        if (isPreviewMode) {
+            showStatus('请在编辑模式下使用加粗功能', true);
+            return;
+        }
         
-        // 自动触发保存
-        saveContent(previousContent);
+        const start = textarea.selectionStart;
+        const end = textarea.selectionEnd;
         
-        showStatus('已撤销上一步', false);
-    } else {
-        showStatus('没有可撤销的更改', false);
-    }
-}
-
-function redoChanges() {
-    const nextContent = undoManager.redo();
-    if (nextContent !== null) {
-        textarea.value = nextContent;
-        printable.textContent = nextContent;
+        let selectedText = '';
+        let newStart = start;
+        let newEnd = end;
         
-        // 自动触发保存
-        saveContent(nextContent);
+        if (start === end) {
+            const content = textarea.value;
+            
+            while (newStart > 0 && !/\s/.test(content[newStart - 1])) {
+                newStart--;
+            }
+            
+            while (newEnd < content.length && !/\s/.test(content[newEnd])) {
+                newEnd++;
+            }
+            
+            selectedText = content.substring(newStart, newEnd);
+            
+            if (!selectedText) {
+                showStatus('请选择要加粗的文本或确保光标在单词中', true);
+                return;
+            }
+        } else {
+            selectedText = textarea.value.substring(start, end);
+            newStart = start;
+            newEnd = end;
+        }
         
-        showStatus('已重做上一步', false);
-    } else {
-        showStatus('没有可重做的更改', false);
-    }
-}
-
-function toggleBoldText() {
-    if (isPreviewMode) {
-        showStatus('请先退出预览模式', true);
-        return;
-    }
-
-    const start = textarea.selectionStart;
-    const end = textarea.selectionEnd;
-    
-    if (start === end) {
-        showStatus('请先选择要加粗的文本', true);
-        return;
-    }
-
-    const selectedText = textarea.value.substring(start, end);
-    const boldText = `**${selectedText}**`;
-    
-    const newContent = 
-        textarea.value.substring(0, start) + 
-        boldText + 
-        textarea.value.substring(end);
-    
-    textarea.value = newContent;
-    printable.textContent = newContent;
-    
-    // 重新设置光标位置
-    textarea.setSelectionRange(start, start + boldText.length);
-    
-    // 触发保存
-    undoManager.save(newContent);
-    debounceSave();
-    
-    showStatus('已加粗选中文本', false);
-}
-
-function togglePreviewMode() {
-    isPreviewMode = !isPreviewMode;
-    
-    if (isPreviewMode) {
-        // 进入预览模式
-        textarea.style.display = 'none';
-        preview.style.display = 'block';
+        const newText = textarea.value.substring(0, newStart) + 
+                       '**' + selectedText + '**' + 
+                       textarea.value.substring(newEnd);
         
-        // 将Markdown风格的**加粗**转换为HTML
-        let previewContent = textarea.value
-            .replace(/&/g, '&amp;')
-            .replace(/</g, '&lt;')
-            .replace(/>/g, '&gt;')
-            .replace(/\*\*(.*?)\*\*/g, '<strong>$1</strong>')
-            .replace(/\n/g, '<br>');
+        textarea.value = newText;
+        saveContent(newText);
+        showStatus('已加粗文本');
         
-        preview.innerHTML = previewContent;
-        previewBtn.innerHTML = '<i class="fas fa-edit"></i>编辑';
-    } else {
-        // 返回编辑模式
-        textarea.style.display = 'block';
-        preview.style.display = 'none';
-        previewBtn.innerHTML = '<i class="fas fa-eye"></i>预览';
-    }
-}
-
-function initializeContent() {
-    getServerContent(function(content, version) {
-        textarea.value = content;
-        printable.textContent = content;
-        serverContent = content;
-        serverVersion = version;
-        undoManager.save(content);
+        textarea.setSelectionRange(newStart, newEnd + 4);
+        textarea.focus();
     });
-}
-
-initializeContent();
-
-textarea.addEventListener('input', () => {
-    if (isPreviewMode) return;
-    isTyping = true;
-    debounceSave();
-    printable.textContent = textarea.value;
-});
-
-textarea.addEventListener('blur', () => {
-    isTyping = false;
-    if (saveTimer) {
-        clearTimeout(saveTimer);
-    }
-    if (textarea.value !== serverContent) {
-        saveContent(textarea.value);
-    }
-});
-
-previewBtn.addEventListener('click', togglePreviewMode);
-boldBtn.addEventListener('click', toggleBoldText);
-copyBtn.addEventListener('click', copyAllContent);
-refreshBtn.addEventListener('click', forceRefreshContent);
-downloadBtn.addEventListener('click', downloadFile);
-undoBtn.addEventListener('click', undoChanges);
-redoBtn.addEventListener('click', redoChanges);
-saveBtn.addEventListener('click', manualSave);
-
-// 键盘快捷键
-document.addEventListener('keydown', (e) => {
-    if (isPreviewMode) return;
     
-    if ((e.ctrlKey || e.metaKey) && e.key === 'z') {
-        e.preventDefault();
-        undoChanges();
-    }
-    if ((e.ctrlKey || e.metaKey) && e.key === 'y') {
-        e.preventDefault();
-        redoChanges();
-    }
-    if ((e.ctrlKey || e.metaKey) && e.key === 's') {
-        e.preventDefault();
-        manualSave();
-    }
-    if ((e.ctrlKey || e.metaKey) && e.key === 'r') {
-        e.preventDefault();
-        forceRefreshContent();
-    }
-    if ((e.ctrlKey || e.metaKey) && e.key === 'b') {
-        e.preventDefault();
-        toggleBoldText();
-    }
-    if ((e.ctrlKey || e.metaKey) && e.key === 'p') {
-        e.preventDefault();
-        togglePreviewMode();
-    }
+    document.getElementById('undoBtn').addEventListener('click', function() {
+        if (isPreviewMode) {
+            showStatus('请在编辑模式下使用撤销功能', true);
+            return;
+        }
+        
+        if (historyIndex > 0) {
+            historyIndex--;
+            textarea.value = history[historyIndex];
+            lastContent = history[historyIndex];
+            saveContent(history[historyIndex], true);
+            showStatus('已撤销上一步操作');
+        } else {
+            showStatus('没有可撤销的操作', true);
+        }
+    });
+    
+    document.getElementById('copyBtn').addEventListener('click', function() {
+        textarea.select();
+        document.execCommand('copy');
+        showStatus('已复制全部内容');
+        window.getSelection().removeAllRanges();
+    });
+    
+    document.getElementById('refreshBtn').addEventListener('click', function() {
+        initializeContent();
+        showStatus('内容已刷新');
+    });
+    
+    saveBtn.addEventListener('click', function() {
+        manualSave().catch(e => console.error('保存处理错误:', e));
+    });
+    
+    document.getElementById('downloadBtn').addEventListener('click', function() {
+        const blob = new Blob([textarea.value], { type: 'text/plain' });
+        const url = URL.createObjectURL(blob);
+        const a = document.createElement('a');
+        a.href = url;
+        a.download = window.location.pathname.split('/').pop() || 'note.txt';
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(url);
+        showStatus('文件已下载');
+    });
+    
+    textarea.addEventListener('input', function() {
+        if (isApplyingRemotePatch) return;
+        
+        lastInputTime = Date.now();
+        const newContent = this.value;
+        
+        history = history.slice(0, historyIndex + 1);
+        history.push(newContent);
+        historyIndex = history.length - 1;
+        
+        setTimeout(() => {
+            if (Date.now() - lastInputTime >= inputDelay) {
+                saveContent(newContent);
+            }
+        }, inputDelay);
+    });
+    
+    initializeContent();
 });
-
-textarea.focus();
 </script>
 </body>
 </html>
