@@ -90,5 +90,8 @@ limitations under the License.
  增加了复制按钮   
  可以下载txt文件   
  可以进行撤销或者重做   
-
+# 效果图：
 ![屏幕截图 2025-03-26 220601](https://github.com/user-attachments/assets/e443a40b-9476-42b9-b1c5-ab8e60ce22b6)
+
+
+感谢Claude 3.5、Deepseek V3 0324。   
