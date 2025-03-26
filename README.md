@@ -78,3 +78,16 @@ distributed under the License is distributed on an "AS IS" BASIS,
 WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
+
+
+
+
+个人改动：
+第一次提交。
+增加了保存提示
+可以切换只读/编辑模式
+可以进行简单的排版
+增加了复制按钮
+可以下载txt文件
+可以进行撤销或者重做
+
