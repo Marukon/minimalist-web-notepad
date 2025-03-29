@@ -1,6 +1,8 @@
 <?php
+ini_set('default_charset', 'UTF-8');
 $save_path = '_tmp';
 header('Cache-Control: no-store');
+header('Content-Type: text/html; charset=UTF-8');
 
 if (!isset($_GET['note']) || strlen($_GET['note']) > 64 || !preg_match('/^[a-zA-Z0-9_-]+$/', $_GET['note'])) {
     header("Location: " . substr(str_shuffle('234579abcdefghjkmnpqrstwxyz'), -5));
@@ -15,11 +17,11 @@ if (isset($_GET['poll'])) {
     $clientVersion = intval($_GET['version'] ?? 0);
     $timeout = 25;
     $startTime = time();
-    
+  
     while (true) {
         clearstatcache();
         $currentVersion = file_exists($version_path) ? intval(file_get_contents($version_path)) : 0;
-        
+      
         if ($currentVersion > $clientVersion) {
             $patches = [];
             if (file_exists($patches_path)) {
@@ -30,21 +32,21 @@ if (isset($_GET['poll'])) {
                     }
                 }
             }
-            
-            header('Content-Type: application/json');
+          
+            header('Content-Type: application/json; charset=UTF-8');
             echo json_encode([
                 'version' => $currentVersion,
                 'patches' => $patches
             ]);
             exit;
         }
-        
+      
         if (time() - $startTime > $timeout) {
-            header('Content-Type: application/json');
+            header('Content-Type: application/json; charset=UTF-8');
             echo json_encode(['timeout' => true]);
             exit;
         }
-        
+      
         usleep(100000);
     }
 }
@@ -65,6 +67,7 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
 
     if ($clientVersion < $currentVersion) {
         header('HTTP/1.1 409 Conflict');
+        header('Content-Type: application/json; charset=UTF-8');
         echo json_encode([
             'serverContent' => $serverData,
             'serverVersion' => $currentVersion
@@ -76,15 +79,15 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         mkdir(dirname($path), 0755, true);
     }
 
-    file_put_contents($path, $text);
+    file_put_contents($path, $text, LOCK_EX);
     $newVersion = $currentVersion + 1;
-    file_put_contents($version_path, $newVersion);
-    
+    file_put_contents($version_path, $newVersion, LOCK_EX);
+  
     $patches = [];
     if (file_exists($patches_path)) {
         $patches = json_decode(file_get_contents($patches_path), true) ?: [];
     }
-    
+  
     if ($patch) {
         $patches[] = [
             'version' => $newVersion,
@@ -95,9 +98,10 @@ if ($_SERVER['REQUEST_METHOD'] === 'POST') {
         if (count($patches) > 50) {
             $patches = array_slice($patches, -50);
         }
-        file_put_contents($patches_path, json_encode($patches));
+        file_put_contents($patches_path, json_encode($patches), LOCK_EX);
     }
 
+    header('Content-Type: application/json; charset=UTF-8');
     echo json_encode([
         'version' => $newVersion,
         'userId' => $userId
@@ -109,7 +113,7 @@ function applyPatch($text, $patch) {
     usort($patch, function($a, $b) {
         return $b['pos'] - $a['pos'];
     });
-    
+  
     foreach ($patch as $p) {
         if ($p['op'] === 'insert') {
             $text = substr($text, 0, $p['pos']) . $p['text'] . substr($text, $p['pos']);
@@ -122,10 +126,12 @@ function applyPatch($text, $patch) {
 
 if (isset($_GET['raw']) || strpos($_SERVER['HTTP_USER_AGENT'], 'curl') === 0 || strpos($_SERVER['HTTP_USER_AGENT'], 'Wget') === 0) {
     if (is_file($path)) {
-        header('Content-type: application/json');
+        header('Content-Type: application/json; charset=UTF-8');
         $version = file_exists($version_path) ? file_get_contents($version_path) : 0;
+        $content = file_get_contents($path);
+        $content = mb_convert_encoding($content, 'UTF-8', mb_detect_encoding($content, 'UTF-8, ISO-8859-1', true));
         echo json_encode([
-            'content' => file_get_contents($path),
+            'content' => $content,
             'version' => $version
         ]);
     } else {
@@ -322,7 +328,10 @@ body {
 <div class="container">
 <textarea id="content"><?php
 if (is_file($path)) {
-    print htmlspecialchars(file_get_contents($path), ENT_QUOTES, 'UTF-8');
+    $content = file_get_contents($path);
+    // 确保内容是UTF-8编码
+    $content = mb_convert_encoding($content, 'UTF-8', mb_detect_encoding($content, 'UTF-8, ISO-8859-1', true));
+    print htmlspecialchars($content, ENT_QUOTES, 'UTF-8');
 }
 ?></textarea>
 <div id="preview"></div>
@@ -337,7 +346,7 @@ document.addEventListener('DOMContentLoaded', function() {
     const statusDiv = document.getElementById('status');
     const previewBtn = document.getElementById('previewBtn');
     const saveBtn = document.getElementById('saveBtn');
-    
+  
     let serverVersion = 0;
     let isPreviewMode = false;
     let userId = Math.random().toString(36).substr(2, 8);
@@ -348,35 +357,55 @@ document.addEventListener('DOMContentLoaded', function() {
     let inputDelay = 300;
     let history = [];
     let historyIndex = -1;
-    
+  
     function initializeContent() {
         fetch(window.location.href + '?raw&_=' + Date.now())
-            .then(response => response.json())
+            .then(response => {
+                if (!response.ok) {
+                    throw new Error('网络请求失败，状态码: ' + response.status);
+                }
+                return response.json();
+            })
             .then(data => {
-                textarea.value = data.content;
-                lastContent = data.content;
-                serverVersion = parseInt(data.version) || 0;
-                history = [data.content];
-                historyIndex = 0;
-                startPolling();
+                // 确保我们正确处理响应内容
+                if (data && data.content !== undefined) {
+                    textarea.value = data.content;
+                    lastContent = data.content;
+                    serverVersion = parseInt(data.version) || 0;
+                    history = [data.content];
+                    historyIndex = 0;
+                    startPolling();
+                } else {
+                    console.warn('收到空内容或无效内容');
+                    textarea.value = '';
+                    lastContent = '';
+                    serverVersion = 0;
+                    history = [''];
+                    historyIndex = 0;
+                    startPolling();
+                }
+            })
+            .catch(error => {
+                console.error('初始化内容失败:', error);
+                showStatus('加载内容失败，请刷新页面重试', true);
             });
     }
-    
+  
     function generatePatch(oldText, newText) {
         if (oldText === newText) return null;
-        
+      
         let start = 0;
         while (start < oldText.length && start < newText.length && oldText[start] === newText[start]) {
             start++;
         }
-        
+      
         let oldEnd = oldText.length;
         let newEnd = newText.length;
         while (oldEnd > start && newEnd > start && oldText[oldEnd - 1] === newText[newEnd - 1]) {
             oldEnd--;
             newEnd--;
         }
-        
+      
         const patch = [];
         if (oldEnd > start) {
             patch.push({
@@ -385,7 +414,7 @@ document.addEventListener('DOMContentLoaded', function() {
                 length: oldEnd - start
             });
         }
-        
+      
         if (newEnd > start) {
             patch.push({
                 op: 'insert',
@@ -393,45 +422,45 @@ document.addEventListener('DOMContentLoaded', function() {
                 text: newText.substring(start, newEnd)
             });
         }
-        
+      
         return patch;
     }
-    
+  
     function applyRemotePatches(patches) {
         if (isApplyingRemotePatch || !patches || patches.length === 0) return;
-        
+      
         isApplyingRemotePatch = true;
         let content = textarea.value;
         const selectionStart = textarea.selectionStart;
         const selectionEnd = textarea.selectionEnd;
-        
+      
         patches.sort((a, b) => a.version - b.version);
-        
+      
         patches.forEach(patchData => {
             if (patchData.patch) {
                 content = applyPatch(content, patchData.patch);
             }
         });
-        
+      
         if (content !== textarea.value) {
             textarea.value = content;
             lastContent = content;
-            
+          
             const lengthDiff = content.length - textarea.value.length;
             const newSelectionStart = Math.max(0, selectionStart + lengthDiff);
             const newSelectionEnd = Math.max(0, selectionEnd + lengthDiff);
-            
+          
             setTimeout(() => {
                 textarea.setSelectionRange(newSelectionStart, newSelectionEnd);
             }, 0);
-            
+          
             history.push(content);
             historyIndex++;
         }
-        
+      
         isApplyingRemotePatch = false;
     }
-    
+  
     function applyPatch(text, patch) {
         [...patch].reverse().forEach(p => {
             if (p.op === 'insert') {
@@ -442,14 +471,19 @@ document.addEventListener('DOMContentLoaded', function() {
         });
         return text;
     }
-    
+  
     function startPolling() {
         if (pollTimeout) {
             clearTimeout(pollTimeout);
         }
-        
+      
         fetch(`${window.location.href}?poll&version=${serverVersion}&_=${Date.now()}`)
-            .then(response => response.json())
+            .then(response => {
+                if (!response.ok) {
+                    throw new Error('网络轮询请求失败，状态码: ' + response.status);
+                }
+                return response.json();
+            })
             .then(data => {
                 if (data.timeout) {
                     pollTimeout = setTimeout(startPolling, 100);
@@ -462,11 +496,11 @@ document.addEventListener('DOMContentLoaded', function() {
                 }
             })
             .catch(error => {
-                console.error('Polling error:', error);
+                console.error('轮询错误:', error);
                 pollTimeout = setTimeout(startPolling, 1000);
             });
     }
-    
+  
     async function saveContent(newContent, isManualSave = false) {
         const now = Date.now();
         if (!isManualSave && now - lastInputTime < inputDelay) {
@@ -478,28 +512,42 @@ document.addEventListener('DOMContentLoaded', function() {
 
         lastContent = newContent;
 
-        const response = await fetch(window.location.href, {
-            method: 'POST',
-            headers: {
-                'Content-Type': 'application/json'
-            },
-            body: JSON.stringify({
-                text: newContent,
-                version: serverVersion,
-                userId: userId,
-                patch: patch
-            })
-        });
+        try {
+            const response = await fetch(window.location.href, {
+                method: 'POST',
+                headers: {
+                    'Content-Type': 'application/json'
+                },
+                body: JSON.stringify({
+                    text: newContent,
+                    version: serverVersion,
+                    userId: userId,
+                    patch: patch
+                })
+            });
 
-        if (!response.ok) {
-            const errorData = await response.json().catch(() => null);
-            const errorMsg = errorData?.message || response.statusText;
-            throw new Error(errorMsg || `HTTP错误: ${response.status}`);
+            if (!response.ok) {
+                const errorData = await response.json().catch(() => null);
+                const errorMsg = errorData?.message || response.statusText;
+                throw new Error(errorMsg || `HTTP错误: ${response.status}`);
+            }
+
+            const data = await response.json();
+            serverVersion = data.version;
+            
+            // 只在手动保存时显示状态信息
+            if (isManualSave) {
+                showStatus('手动保存成功 ' + new Date().toLocaleTimeString());
+            }
+            
+            return data;
+        } catch (error) {
+            console.error('保存内容时出错:', error);
+            if (isManualSave) {
+                showStatus('保存失败: ' + (error.message || '服务器错误'), true);
+            }
+            throw error;
         }
-
-        const data = await response.json();
-        serverVersion = data.version;
-        return data;
     }
 
     async function manualSave() {
@@ -507,19 +555,17 @@ document.addEventListener('DOMContentLoaded', function() {
             showStatus('请在编辑模式下保存', true);
             return;
         }
-        
+      
         const originalHTML = saveBtn.innerHTML;
-        
+      
         saveBtn.innerHTML = '<i class="fas fa-spinner"></i>保存中...';
         saveBtn.disabled = true;
-        
+      
         try {
             const result = await saveContent(textarea.value, true);
-            showStatus('手动保存成功 ' + new Date().toLocaleTimeString());
             return result;
         } catch (error) {
             console.error('保存失败:', error);
-            showStatus('手动保存失败: ' + (error.message || '服务器错误'), true);
             throw error;
         } finally {
             saveBtn.innerHTML = originalHTML;
@@ -535,7 +581,7 @@ document.addEventListener('DOMContentLoaded', function() {
         historyIndex++;
         showStatus('已从服务器加载最新内容');
     }
-    
+  
     function showStatus(message, isError = false) {
         statusDiv.textContent = message;
         statusDiv.style.backgroundColor = isError ? '#f44336' : '#4CAF50';
@@ -544,10 +590,10 @@ document.addEventListener('DOMContentLoaded', function() {
             statusDiv.style.opacity = 0;
         }, 2000);
     }
-    
-  previewBtn.addEventListener('click', function() {
+  
+    previewBtn.addEventListener('click', function() {
         isPreviewMode = !isPreviewMode;
-        
+      
         if (isPreviewMode) {
             textarea.style.display = 'none';
             preview.style.display = 'block';
@@ -564,33 +610,33 @@ document.addEventListener('DOMContentLoaded', function() {
             this.innerHTML = '<i class="fas fa-eye"></i>预览';
         }
     });
-    
+  
     document.getElementById('boldBtn').addEventListener('click', function() {
         if (isPreviewMode) {
             showStatus('请在编辑模式下使用加粗功能', true);
             return;
         }
-        
+      
         const start = textarea.selectionStart;
         const end = textarea.selectionEnd;
-        
+      
         let selectedText = '';
         let newStart = start;
         let newEnd = end;
-        
+      
         if (start === end) {
             const content = textarea.value;
-            
+          
             while (newStart > 0 && !/\s/.test(content[newStart - 1])) {
                 newStart--;
             }
-            
+          
             while (newEnd < content.length && !/\s/.test(content[newEnd])) {
                 newEnd++;
             }
-            
+          
             selectedText = content.substring(newStart, newEnd);
-            
+          
             if (!selectedText) {
                 showStatus('请选择要加粗的文本或确保光标在单词中', true);
                 return;
@@ -600,25 +646,25 @@ document.addEventListener('DOMContentLoaded', function() {
             newStart = start;
             newEnd = end;
         }
-        
+      
         const newText = textarea.value.substring(0, newStart) + 
                        '**' + selectedText + '**' + 
                        textarea.value.substring(newEnd);
-        
+      
         textarea.value = newText;
         saveContent(newText);
         showStatus('已加粗文本');
-        
+      
         textarea.setSelectionRange(newStart, newEnd + 4);
         textarea.focus();
     });
-    
+  
     document.getElementById('undoBtn').addEventListener('click', function() {
         if (isPreviewMode) {
             showStatus('请在编辑模式下使用撤销功能', true);
             return;
         }
-        
+      
         if (historyIndex > 0) {
             historyIndex--;
             textarea.value = history[historyIndex];
@@ -629,25 +675,25 @@ document.addEventListener('DOMContentLoaded', function() {
             showStatus('没有可撤销的操作', true);
         }
     });
-    
+  
     document.getElementById('copyBtn').addEventListener('click', function() {
         textarea.select();
         document.execCommand('copy');
         showStatus('已复制全部内容');
         window.getSelection().removeAllRanges();
     });
-    
+  
     document.getElementById('refreshBtn').addEventListener('click', function() {
         initializeContent();
         showStatus('内容已刷新');
     });
-    
+  
     saveBtn.addEventListener('click', function() {
         manualSave().catch(e => console.error('保存处理错误:', e));
     });
-    
+  
     document.getElementById('downloadBtn').addEventListener('click', function() {
-        const blob = new Blob([textarea.value], { type: 'text/plain' });
+        const blob = new Blob([textarea.value], { type: 'text/plain;charset=utf-8' });
         const url = URL.createObjectURL(blob);
         const a = document.createElement('a');
         a.href = url;
@@ -658,24 +704,24 @@ document.addEventListener('DOMContentLoaded', function() {
         URL.revokeObjectURL(url);
         showStatus('文件已下载');
     });
-    
+  
     textarea.addEventListener('input', function() {
         if (isApplyingRemotePatch) return;
-        
+      
         lastInputTime = Date.now();
         const newContent = this.value;
-        
+      
         history = history.slice(0, historyIndex + 1);
         history.push(newContent);
         historyIndex = history.length - 1;
-        
+      
         setTimeout(() => {
             if (Date.now() - lastInputTime >= inputDelay) {
                 saveContent(newContent);
             }
         }, inputDelay);
     });
-    
+  
     initializeContent();
 });
 </script>
